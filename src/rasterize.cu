@@ -331,7 +331,7 @@ void rasterizeSetBuffers(const tinygltf::Scene & scene) {
 
 	// 2. for each mesh: 
 	//		for each primitive: 
-	//			build device buffer of indices, materail, and each attributes
+	//			build device buffer of indices, material, and each attributes
 	//			and store these pointers in a map
 	{
 
@@ -636,12 +636,17 @@ void _vertexTransformAndAssembly(
 
 		// TODO: Apply vertex transformation here
 		// Multiply the MVP matrix for each vertex position, this will transform everything into clipping space
+		glm::vec4 modelPosition(primitive.dev_position[vid], 1.0f);
+		glm::vec4 clipPosition = MVP * modelPosition;
 		// Then divide the pos by its w element to transform into NDC space
+		glm::vec4 ndcPosition = clipPosition / clipPosition.w;
 		// Finally transform x and y to viewport space
+		float x = (ndcPosition.x + 1.0f) * (width * 0.5f);
+		float y = (ndcPosition.y + 1.0f) * (height * 0.5f);
 
 		// TODO: Apply vertex assembly here
-		// Assemble all attribute arraies into the primitive array
-		
+		// Assemble all attribute arrays into the primitive array
+		primitive.dev_verticesOut[vid].pos = glm::vec4(x, y, ndcPosition.z, 1.0f);
 	}
 }
 
@@ -660,12 +665,12 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 		// TODO: uncomment the following code for a start
 		// This is primitive assembly for triangles
 
-		//int pid;	// id for cur primitives vector
-		//if (primitive.primitiveMode == TINYGLTF_MODE_TRIANGLES) {
-		//	pid = iid / (int)primitive.primitiveType;
-		//	dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
-		//		= primitive.dev_verticesOut[primitive.dev_indices[iid]];
-		//}
+		int pid;	// id for cur primitives vector
+		if (primitive.primitiveMode == TINYGLTF_MODE_TRIANGLES) {
+			pid = iid / (int)primitive.primitiveType;
+			dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
+				= primitive.dev_verticesOut[primitive.dev_indices[iid]];
+		}
 
 
 		// TODO: other primitive types (point, line)
@@ -673,6 +678,18 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 	
 }
 
+__global__
+void _rasterize(int numPrimitives, Primitive* dev_primitives, Fragment* dev_fragmentBuffer) {
+	int index = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (index < numPrimitives) {
+		Primitive primitive = dev_primitives[index];
+		glm::vec3 v0 = glm::vec3(primitive.v[0].pos);
+		glm::vec3 v1 = glm::vec3(primitive.v[1].pos);
+		glm::vec3 v2 = glm::vec3(primitive.v[2].pos);
+		
+	}
+}
 
 
 /**
