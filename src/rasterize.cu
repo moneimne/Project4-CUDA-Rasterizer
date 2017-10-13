@@ -18,6 +18,9 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#define BILINEAR_FILTERING
+#define PERSPECTIVE_CORRECT_TEXTURE
+
 namespace {
 
 	typedef unsigned short VertexIndex;
@@ -46,7 +49,7 @@ namespace {
 		// glm::vec3 col;
 		 glm::vec2 texcoord0;
 		 TextureData* dev_diffuseTex = NULL;
-		// int texWidth, texHeight;
+		 int texWidth, texHeight;
 		// ...
 	};
 
@@ -64,8 +67,9 @@ namespace {
 
 		glm::vec3 eyePos;	// eye space position used for shading
 		glm::vec3 eyeNor;
-		// VertexAttributeTexcoord texcoord0;
-		// TextureData* dev_diffuseTex;
+		VertexAttributeTexcoord texcoord0;
+		TextureData* dev_diffuseTex;
+		int texWidth, texHeight;
 		// ...
 	};
 
@@ -113,8 +117,6 @@ static int *dev_mutex = NULL;
 
 static float * dev_depth = NULL;	// you might need this buffer when doing depth test
 
-__constant__ float *dev_gaussianKernel[9];
-
 /**
  * Kernel that writes the image to the OpenGL PBO directly.
  */
@@ -137,6 +139,38 @@ void sendImageToPBO(uchar4 *pbo, int w, int h, glm::vec3 *image) {
     }
 }
 
+__device__
+glm::vec3 colorAt(TextureData* texture, int textureWidth, float u, float v) {
+	int flatIndex = u + v * textureWidth;
+	float r = (float)texture[flatIndex * 3] / 255.0f;
+	float g = (float)texture[flatIndex * 3 + 1] / 255.0f;
+	float b = (float)texture[flatIndex * 3 + 2] / 255.0f;
+	return glm::vec3(r, g, b);
+}
+
+__device__
+glm::vec3 getBilinearFilteredColor(TextureData* texture, int textureWidth, int textureHeight, float u, float v) {
+	float x = u * (float)textureWidth;
+	float y = v * (float)textureHeight;
+	float floorX = glm::floor(x);
+	float floorY = glm::floor(y);
+	float deltaX = x - floorX;
+	float deltaY = y - floorY;
+
+	int xPos = (int)floorX;
+	int yPos = (int)floorY;
+	int xPlusOne = glm::clamp(xPos + 1, 0, textureWidth - 1);
+	int yPlusOne = glm::clamp(yPos + 1, 0, textureHeight - 1);
+
+	glm::vec3 v0 = colorAt(texture, textureWidth, xPos, yPos);
+	glm::vec3 v1 = colorAt(texture, textureWidth, xPlusOne, yPos);
+	glm::vec3 v2 = colorAt(texture, textureWidth, xPos, yPlusOne);
+	glm::vec3 v3 = colorAt(texture, textureWidth, xPlusOne, yPlusOne);
+	glm::vec3 mix01 = glm::mix(v0, v1, deltaX);
+	glm::vec3 mix23 = glm::mix(v2, v3, deltaX);
+	return glm::mix(mix01, mix23, deltaY);
+}
+
 /** 
 * Writes fragment colors to the framebuffer
 */
@@ -151,7 +185,21 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer, floa
 		glm::vec3 normal = glm::normalize(fragment.eyeNor);
 		glm::vec3 lightPos(0.0f);
 		glm::vec3 lightDir = glm::normalize(lightPos - fragment.eyePos);
-		framebuffer[index] = fragment.color * glm::dot(normal, lightDir);
+
+		glm::vec3 color;
+		if (fragment.dev_diffuseTex != NULL) {
+#ifdef BILINEAR_FILTERING
+			color = getBilinearFilteredColor(fragment.dev_diffuseTex, fragment.texWidth, fragment.texHeight, fragment.texcoord0.x, fragment.texcoord0.y);
+#else
+			int u = fragment.texcoord0.x * fragment.texWidth;
+			int v = fragment.texcoord0.y * fragment.texHeight;
+			color = colorAt(fragment.dev_diffuseTex, fragment.texWidth, u, v);
+#endif
+		}
+		else {
+			color = fragment.color;
+		}
+		framebuffer[index] = color * glm::dot(normal, lightDir);
     }
 }
 
@@ -659,6 +707,10 @@ void _vertexTransformAndAssembly(
 		primitive.dev_verticesOut[vid].pos = glm::vec4(x, y, z, 1.0f);
 		primitive.dev_verticesOut[vid].eyePos = glm::vec3(MV * modelPosition);
 		primitive.dev_verticesOut[vid].eyeNor = glm::normalize(MV_normal * primitive.dev_normal[vid]);
+		primitive.dev_verticesOut[vid].texcoord0 = primitive.dev_texcoord0[vid];
+		primitive.dev_verticesOut[vid].dev_diffuseTex = primitive.dev_diffuseTex;
+		primitive.dev_verticesOut[vid].texWidth = primitive.diffuseTexWidth;
+		primitive.dev_verticesOut[vid].texHeight = primitive.diffuseTexHeight;
 	}
 }
 
@@ -727,6 +779,16 @@ void _rasterize(int numPrimitives, Primitive* dev_primitives, Fragment* dev_frag
 					// Position
 					glm::vec3 position = barycentricCoord.x * v0.eyePos + barycentricCoord.y * v1.eyePos + barycentricCoord.z * v2.eyePos;
 
+					// Texture coordinate
+					glm::vec2 texCoord;
+#ifdef PERSPECTIVE_CORRECT_TEXTURE
+					glm::vec2 texCoordZ = barycentricCoord.x * (v0.texcoord0 / v0.eyePos.z) + barycentricCoord.y * (v1.texcoord0 / v1.eyePos.z) + barycentricCoord.z * (v2.texcoord0 / v2.eyePos.z);
+					float coordZ = barycentricCoord.x * (1.0f / v0.eyePos.z) + barycentricCoord.y * (1.0f / v1.eyePos.z) + barycentricCoord.z * (1.0f / v2.eyePos.z);
+					texCoord = texCoordZ / coordZ;
+#else
+					texCoord = barycentricCoord.x * v0.texcoord0 + barycentricCoord.y * v1.texcoord0 + barycentricCoord.z * v2.texcoord0;
+#endif
+
 					bool isSet;
 					do {
 						isSet = (atomicCAS(dev_mutex, 0, 1) == 0);
@@ -742,6 +804,13 @@ void _rasterize(int numPrimitives, Primitive* dev_primitives, Fragment* dev_frag
 
 								// Eye position
 								dev_fragmentBuffer[flatIndex].eyePos = position;
+
+								// Texture coordinate
+								dev_fragmentBuffer[flatIndex].texcoord0 = texCoord;
+
+								dev_fragmentBuffer[flatIndex].dev_diffuseTex = v0.dev_diffuseTex;
+								dev_fragmentBuffer[flatIndex].texWidth = v0.texWidth;
+								dev_fragmentBuffer[flatIndex].texHeight = v0.texHeight;
 							}
 
 							// Reset mutex
