@@ -18,8 +18,9 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-#define BILINEAR_FILTERING
-#define PERSPECTIVE_CORRECT_TEXTURE
+//#define BILINEAR_FILTERING
+//#define PERSPECTIVE_CORRECT_TEXTURE
+//#define GAUSSIAN_BLUR
 
 namespace {
 
@@ -112,6 +113,7 @@ static int totalNumPrimitives = 0;
 static Primitive *dev_primitives = NULL;
 static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
+static glm::vec3 *dev_postprocess = NULL;
 
 static int *dev_mutex = NULL;
 
@@ -199,7 +201,13 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer, floa
 		else {
 			color = fragment.color;
 		}
-		framebuffer[index] = color * glm::dot(normal, lightDir);
+		float NdotL = glm::dot(normal, lightDir);
+		if (NdotL == NdotL) {
+			framebuffer[index] = color * glm::dot(normal, lightDir);
+		}
+		else {
+			framebuffer[index] = color;
+		}
     }
 }
 
@@ -215,9 +223,11 @@ void rasterizeInit(int w, int h) {
     cudaFree(dev_framebuffer);
     cudaMalloc(&dev_framebuffer,   width * height * sizeof(glm::vec3));
     cudaMemset(dev_framebuffer, 0, width * height * sizeof(glm::vec3));
+	cudaFree(dev_postprocess);
+	cudaMalloc(&dev_postprocess, width * height * sizeof(glm::vec3));
 
 	cudaFree(dev_mutex);
-	cudaMalloc(&dev_mutex, sizeof(int));
+	cudaMalloc(&dev_mutex, width * height * sizeof(int));
 	cudaMemset(dev_mutex, 0, sizeof(int));
     
 	cudaFree(dev_depth);
@@ -757,10 +767,10 @@ void _rasterize(int numPrimitives, Primitive* dev_primitives, Fragment* dev_frag
 		glm::vec3 p2 = glm::vec3(v2.pos);
 		glm::vec3 triPos[3] = { p0, p1, p2 };
 		
-		int minX = (int)glm::floor(glm::min(glm::min(p0.x, p1.x), p2.x));
-		int minY = (int)glm::floor(glm::min(glm::min(p0.y, p1.y), p2.y));
-		int maxX = (int)glm::ceil(glm::max(glm::max(p0.x, p1.x), p2.x));
-		int maxY = (int)glm::ceil(glm::max(glm::max(p0.y, p1.y), p2.y));
+		int minX = glm::max((int)glm::floor(glm::min(glm::min(p0.x, p1.x), p2.x)), 0);
+		int minY = glm::max((int)glm::floor(glm::min(glm::min(p0.y, p1.y), p2.y)), 0);
+		int maxX = glm::min((int)glm::ceil(glm::max(glm::max(p0.x, p1.x), p2.x)), width - 1);
+		int maxY = glm::min((int)glm::ceil(glm::max(glm::max(p0.y, p1.y), p2.y)), height - 1);
 
 		for (int x = minX; x <= maxX; x++) {
 			for (int y = minY; y <= maxY; y++) {
@@ -788,39 +798,95 @@ void _rasterize(int numPrimitives, Primitive* dev_primitives, Fragment* dev_frag
 #else
 					texCoord = barycentricCoord.x * v0.texcoord0 + barycentricCoord.y * v1.texcoord0 + barycentricCoord.z * v2.texcoord0;
 #endif
-
+					Fragment fragment;
+					fragment.color = glm::vec3(0.0f, 0.0f, 0.8f);
+					fragment.eyeNor = normal;
+					fragment.eyePos = position;
+					fragment.texcoord0 = texCoord;
+					fragment.dev_diffuseTex = v0.dev_diffuseTex;
+					fragment.texWidth = v0.texWidth;
+					fragment.texHeight = v0.texHeight;
 					bool isSet;
 					do {
-						isSet = (atomicCAS(dev_mutex, 0, 1) == 0);
+						isSet = (atomicCAS(&dev_mutex[flatIndex], 0, 1) == 0);
 						if (isSet) {
 							if (dev_depth[flatIndex] > depth) {
 								dev_depth[flatIndex] = depth;
-
-								// Color
-								dev_fragmentBuffer[flatIndex].color = glm::vec3(0.0f, 0.0f, 0.8f);
-
-								// Eye normal
-								dev_fragmentBuffer[flatIndex].eyeNor = normal;
-
-								// Eye position
-								dev_fragmentBuffer[flatIndex].eyePos = position;
-
-								// Texture coordinate
-								dev_fragmentBuffer[flatIndex].texcoord0 = texCoord;
-
-								dev_fragmentBuffer[flatIndex].dev_diffuseTex = v0.dev_diffuseTex;
-								dev_fragmentBuffer[flatIndex].texWidth = v0.texWidth;
-								dev_fragmentBuffer[flatIndex].texHeight = v0.texHeight;
+								dev_fragmentBuffer[flatIndex] = fragment;
 							}
 
 							// Reset mutex
-							*dev_mutex = 0;
+							dev_mutex[flatIndex] = 0;
 						}
 					} while (!isSet);
 				}
 			}
 		}
 	}
+}
+
+__global__
+void gaussianBlurWidth(int width, int height, glm::vec3 *dev_framebuffer, glm::vec3 *dev_postprocess) {
+	extern __shared__ glm::vec3 sharedRow[];
+	int x = threadIdx.x;
+	int y = blockIdx.x;
+
+	float weight[5] = { 0.227027f, 0.1945946, 0.1216216, 0.054054, 0.016216 };
+
+	if (x >= width || y >= height) {
+		return;
+	}
+
+	// Load row into shared memory
+	int flatIndex = x + (width * y);
+	sharedRow[x] = dev_framebuffer[flatIndex];
+
+	__syncthreads();
+
+	// Gaussian filter over row
+	glm::vec3 result = sharedRow[x] * weight[0];
+	for (int i = 1; i < 5; i++) {
+		if (x + i < width) {
+			result += sharedRow[x + i] * weight[i];
+		}
+		if (x - i >= 0) {
+			result += sharedRow[x - i] * weight[i];
+		}
+	}
+	
+	dev_postprocess[flatIndex] = result;
+}
+
+__global__
+void gaussianBlurHeight(int width, int height, glm::vec3 *dev_framebuffer, glm::vec3 *dev_postprocess) {
+	extern __shared__ glm::vec3 sharedColumn[];
+	int x = blockIdx.x;
+	int y = threadIdx.x;
+
+	float weight[5] = { 0.227027f, 0.1945946, 0.1216216, 0.054054, 0.016216 };
+
+	if (x >= width || y >= height) {
+		return;
+	}
+
+	// Load column into shared memory
+	int flatIndex = (y * width) + x;
+	sharedColumn[y] = dev_framebuffer[flatIndex];
+
+	__syncthreads();
+
+	// Gaussian filter over column
+	glm::vec3 result = sharedColumn[y] * weight[0];
+	for (int i = 1; i < 5; i++) {
+		if (y + i < height) {
+			result += sharedColumn[y + i] * weight[i];
+		}
+		if (y - i >= 0) {
+			result += sharedColumn[y - i] * weight[i];
+		}
+	}
+
+	dev_postprocess[flatIndex] = result;
 }
 
 /**
@@ -881,6 +947,23 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	render << <blockCount2d, blockSize2d >> >(width, height, dev_fragmentBuffer, dev_framebuffer, dev_depth);
 	checkCUDAError("fragment shader");
 
+#ifdef GAUSSIAN_BLUR
+	// Gaussian blur
+	dim3 threadsPerBlock(width);
+	dim3 blocksPerGrid(height);
+	size_t sharedMemorySize(width * sizeof(glm::vec3));
+	gaussianBlurWidth<<<blocksPerGrid, threadsPerBlock, sharedMemorySize>>>(width, height, dev_framebuffer, dev_postprocess);
+
+	threadsPerBlock = height;
+	blocksPerGrid = width;
+	sharedMemorySize = height * sizeof(glm::vec3);
+	gaussianBlurHeight<<<blocksPerGrid, threadsPerBlock, sharedMemorySize>>>(width, height, dev_framebuffer, dev_postprocess);
+
+	glm::vec3 *temp = dev_postprocess;
+	dev_postprocess = dev_framebuffer;
+	dev_framebuffer = temp;
+#endif
+
     // Copy framebuffer into OpenGL buffer for OpenGL previewing
     sendImageToPBO<<<blockCount2d, blockSize2d>>>(pbo, width, height, dev_framebuffer);
     checkCUDAError("copy render result to pbo");
@@ -920,6 +1003,9 @@ void rasterizeFree() {
 
     cudaFree(dev_framebuffer);
     dev_framebuffer = NULL;
+
+	cudaFree(dev_postprocess);
+	dev_postprocess = NULL;
 
 	cudaFree(dev_mutex);
 	dev_mutex = NULL;
